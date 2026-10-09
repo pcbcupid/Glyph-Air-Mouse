@@ -1,12 +1,9 @@
-# Glyph H2 projects
+# glyph_h2_air_mouse
 
 Board: PCB Cupid Glyph H2 (ESP32-H2) — https://learn.pcbcupid.com/
 
 ## Sketches
-- `glyph_h2_mpu6050/` — reads MPU6050, prints accel/gyro/roll/pitch/temp over USB serial
 - `glyph_h2_air_mouse/` — **LATEST** Wii-remote style pointer (absolute): point the flat board, swing left/right (±15°) / tip up/down (±12°); straight ahead = screen centre. Up/down uses a 2-state Kalman filter (gyro + accel, no drift); left/right is the gyro rate around true vertical (tilt-compensated), Kalman-filtered, integrated to an angle and smoothed by a One Euro filter (may drift slowly). The accelerometer is trusted less while the board is being pushed (whole-arm movement). Buttons: K3 = left click (hold = drag), K2 (middle) = right click, K1 tap = re-centre, K1 hold = scroll mode (tilt up/down to scroll, further = faster). Clicks are stabilized (click lands where the cursor was just before the press; cursor freezes 150 ms around press/release; a second click within 0.4 s lands on the same spot, so double-click works). Lying still it sends nothing, so the touchpad works. Works buttons-up or buttons-down (detected from gravity at RESET).
-- `glyph_h2_slide_mouse/` — development folder the air mouse was built in (same code as `glyph_h2_air_mouse/` right now); kept for reference
-- `glyph_h2_ble_mouse/` — Bluetooth air mouse (absolute pointer): twist wrist = left/right, tip up/down = up/down; board level = screen centre, ±40° twist / ±30° tip = screen edges. BOOT tap = left click, hold = right click. Keep still ~1 s at power-up to calibrate.
 
 ## MPU6050 wiring
 | MPU6050 | Glyph H2 |
@@ -16,10 +13,8 @@ Board: PCB Cupid Glyph H2 (ESP32-H2) — https://learn.pcbcupid.com/
 | SDA | IO23 |
 | SCL | IO24 |
 | AD0 | IO1 (driven LOW → address 0x68) |
-| XDA / XCL | IO25 / IO22 (unused, can be removed) |
-| INT | IO27 — move it: IO27 is USB D+ (use IO10 or leave unconnected) |
 
-## Button module (1x3) wiring — used by `glyph_h2_air_mouse/` and `glyph_h2_slide_mouse/`
+## Button module (1x3) wiring
 | Module | Glyph H2 |
 |---|---|
 | VCC | 3.3V |
