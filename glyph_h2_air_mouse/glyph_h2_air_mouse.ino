@@ -1,18 +1,19 @@
 /*
- * Glyph H2 - Bluetooth air mouse (absolute pointer, Wii-remote style) - latest version
+ * Glyph H2 - Bluetooth air mouse (point-to-move, Wii-remote style) - latest version
  *
- * Point the board like a remote: where it points is where the cursor goes.
- *   left/right swing (yaw)  -> cursor left/right, ±YAW_RANGE_DEG = screen edges
- *   up/down tip (pitch)     -> cursor up/down,    ±PITCH_RANGE_DEG = screen edges
- * Pointing straight ahead (level) = screen centre. Swinging past an edge keeps
- * the cursor at the edge, and coming back lines up again.
+ * Point the board like a remote to move the cursor:
+ *   left/right swing (yaw)  -> cursor left/right, 2 x YAW_RANGE_DEG = screen width
+ *   up/down tip (pitch)     -> cursor up/down,    2 x PITCH_RANGE_DEG = screen height
+ * It sends relative movement like a normal mouse, so the cursor always carries
+ * on from where it is, even after the touchpad moved it.
  *
  * The board only controls the cursor while it is being moved: lying still it
- * sends nothing, so the touchpad works normally. Moving it takes over again.
+ * sends nothing, so the touchpad works normally. Moving it takes over again,
+ * starting from wherever the cursor is.
  *
  * Buttons (1x3 module):
  *   K3 = left click (hold = drag), K2 (middle) = right click,
- *   K1 short press = re-centre (whatever direction you point now = screen centre),
+ *   K1 short press = re-centre (whatever direction you point now = middle of the swing range),
  *   K1 hold = scroll mode: cursor freezes, tilt up/down to scroll up/down
  *             (further tilt = faster); release to carry on pointing.
  *
@@ -28,6 +29,16 @@
  *
  * Keep the board still for ~1 s after power-up while it calibrates.
  *
+ * Bluetooth name: type "NAME My Mouse" in the Serial Monitor (115200 baud,
+ * newline), then press RESET. The name is saved in flash. "NAME" alone
+ * shows the current name.
+ *
+ * Sleep: after SLEEP_IDLE_MIN minutes without movement or buttons (or
+ * SLEEP_UNCONNECTED_MIN minutes without a connection) the board goes into
+ * deep sleep with the MPU6050 asleep too. Press any button to wake it: it
+ * restarts, calibrates (keep it still ~1 s) and reconnects by itself.
+ * "SLEEP" in the Serial Monitor sends it to sleep straight away.
+ *
  * Wiring: MPU6050 SDA=IO23, SCL=IO24, AD0=IO1 (driven LOW -> 0x68)
  *         Button module VCC=3.3V, GND=IO14 (driven LOW), D1=IO13, D2=IO12, D3=IO10
  */
@@ -38,6 +49,12 @@
 #include <BLEServer.h>
 #include <BLEHIDDevice.h>
 #include <BLESecurity.h>
+#include <Preferences.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
+
+#define DEFAULT_NAME "Glyph H2 Mouse"
+const int BT_NAME_MAX = 20;  // longer names don't fit in the advertising packet
 
 #define SDA_PIN 23
 #define SCL_PIN 24
@@ -51,7 +68,9 @@
 
 #define MPU_ADDR 0x68
 
-#define POS_MAX 32767   // absolute coordinate range 0..POS_MAX covers the whole screen
+#define POS_MAX 32767   // internal coordinate range 0..POS_MAX covers one screen
+const float SCREEN_W_PX = 1366;  // laptop screen size: a full swing range moves this far
+const float SCREEN_H_PX = 768;
 
 // Tuning
 const float YAW_RANGE_DEG = 15.0;    // swing this far left/right to reach the screen edge
@@ -65,15 +84,22 @@ const uint32_t DEBOUNCE_MS = 20;
 // Click stabilization: pressing a button jolts the board slightly. The click
 // lands where the cursor was CLICK_LOOKBACK samples (x10 ms) before the press,
 // and the cursor freezes for CLICK_FREEZE_MS after each press and release.
+// While a button is held the cursor stays locked until the board turns more
+// than DRAG_START_DEG (then it drags). Movement during a freeze or lock is
+// thrown away, so the cursor carries on from where it stopped.
 const int CLICK_LOOKBACK = 6;          // 60 ms
-const uint32_t CLICK_FREEZE_MS = 150;
-const uint32_t DOUBLE_CLICK_MS = 400;  // a press this soon after the last click reuses its exact spot
+const uint32_t CLICK_FREEZE_MS = 250;
+const uint32_t DOUBLE_CLICK_MS = 700;  // a press this soon after the last click reuses its exact spot
+const float DRAG_START_DEG = 3.0;      // turn this far with a button held to start dragging
 // Scroll mode (hold K1)
 const uint32_t SCROLL_HOLD_MS = 400;   // hold K1 this long to enter scroll mode
 const float SCROLL_DEADZONE_DEG = 3.0; // tilt less than this doesn't scroll
 const float SCROLL_SPEED = 0.6;        // wheel clicks per second per degree of tilt
 const float SCROLL_MAX = 30.0;         // wheel clicks per second at most
 const uint32_t REPORT_MS = 10;       // 100 Hz
+// Sleep (any button wakes it)
+const uint32_t SLEEP_IDLE_MIN = 5;         // connected but not used for this long
+const uint32_t SLEEP_UNCONNECTED_MIN = 2;  // no laptop connected for this long
 
 // Axes and directions (board flat). Flip a sign if that direction is reversed.
 const int YAW_AXIS = 2, YAW_SIGN = -1;      // gyro Z: swing left/right
@@ -114,11 +140,11 @@ const uint8_t hidReportDescriptor[] = {
   0x05, 0x01,        //     Usage Page (Generic Desktop)
   0x09, 0x30,        //     Usage (X)
   0x09, 0x31,        //     Usage (Y)
-  0x16, 0x00, 0x00,  //     Logical Minimum (0)
+  0x16, 0x01, 0x80,  //     Logical Minimum (-32767)
   0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
   0x75, 0x10,        //     Report Size (16)
   0x95, 0x02,        //     Report Count (2)
-  0x81, 0x02,        //     Input (Data, Var, Abs)
+  0x81, 0x06,        //     Input (Data, Var, Rel)
   0x09, 0x38,        //     Usage (Wheel)
   0x15, 0x81,        //     Logical Minimum (-127)
   0x25, 0x7F,        //     Logical Maximum (127)
@@ -133,8 +159,8 @@ const uint8_t hidReportDescriptor[] = {
 // so it is not part of the payload.
 struct MouseReport {
   uint8_t buttons;
-  uint16_t x;
-  uint16_t y;
+  int16_t dx;  // relative movement in pixels
+  int16_t dy;
   int8_t wheel;
 } __attribute__((packed));
 
@@ -236,11 +262,16 @@ float yawAngle = 0;         // integrated swing angle, deg (0 = centre)
 float yawAnchor = 0, pitchAnchor = 0;  // jitter-free angles used for the cursor
 float pitchOffset = 0;      // up/down angle that maps to the screen centre (0 = level)
 float orient = 1;           // +1 = MPU6050 facing up (buttons down), -1 = flipped (buttons up)
-uint16_t lastX = 0xFFFF, lastY = 0xFFFF;
+uint16_t lastX = 0xFFFF, lastY = 0xFFFF;  // cursor position to report next
+uint16_t sentX = 0xFFFF, sentY = 0xFFFF;  // position last sent to the laptop
+bool wasActive = false;
 uint8_t buttons = 0;
 uint32_t lastActive = 0;    // last time the board was being moved
 uint32_t freezeUntil = 0;   // cursor ignores movement until this time (click stabilization)
 uint32_t lastRelease = 0;   // when a button was last released (double-click detection)
+bool holdLock = false;      // button held, cursor locked until the board turns DRAG_START_DEG
+bool wasLocked = false;
+float pressYaw = 0, pressPitch = 0;  // angles when the button was pressed
 uint16_t clickX = 0, clickY = 0;  // where the last click landed
 const int HIST_LEN = 16;
 uint16_t histX[HIST_LEN], histY[HIST_LEN];  // recent cursor positions, one per sample
@@ -248,11 +279,17 @@ int histIdx = 0, histCount = 0;
 bool scrollMode = false;    // K1 held: tilt up/down scrolls instead of moving the cursor
 uint32_t k1Start = 0;
 float scrollStartPitch = 0, scrollSavedYaw = 0, scrollAcc = 0;
+uint32_t lastUse = 0;       // last movement, button press, connect or disconnect (sleep timer)
+// Kept through deep sleep: button released levels, since the wake-up button
+// is still held at startup and would be mistaken for "released"
+RTC_DATA_ATTR bool savedIdleValid = false;
+RTC_DATA_ATTR bool savedIdle[3];
 
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) {
     connected = true;
-    lastX = lastY = 0xFFFF;  // force a report so the cursor jumps into place
+    lastUse = millis();
+    lastX = lastY = sentX = sentY = 0xFFFF;  // fresh start, no jump from old positions
     Serial.println("Laptop connected");
   }
 #if defined(CONFIG_NIMBLE_ENABLED)
@@ -267,6 +304,7 @@ class ServerCallbacks : public BLEServerCallbacks {
 #endif
   void onDisconnect(BLEServer *s) {
     connected = false;
+    lastUse = millis();
     Serial.println("Disconnected, advertising again");
     BLEDevice::startAdvertising();
   }
@@ -308,14 +346,20 @@ float accelPitch(const float acc[3]) {
 
 void sendReport(uint16_t x, uint16_t y, int8_t wheel = 0);
 
-// Pointing direction now = screen centre, and move the cursor there.
+void rebase(uint16_t x, uint16_t y);
+
+// Start pointing afresh from wherever the laptop cursor is now: the current
+// direction becomes the middle of the pointing range, without moving the cursor.
+void restartPointing() {
+  rebase(POS_MAX / 2, POS_MAX / 2);
+  lastX = lastY = sentX = sentY = POS_MAX / 2;
+  histCount = 0;
+}
+
+// K1 tap: pointing direction now = middle of the range (full swing both ways)
 void recenter() {
   lastActive = millis();  // follow the board straight away after re-centring
-  yawAngle = yawAnchor = 0;
-  yawEuro.reset(0);
-  pitchOffset = pitchAnchor;
-  if (connected) sendReport(POS_MAX / 2, POS_MAX / 2);
-  else lastX = lastY = 0xFFFF;
+  restartPointing();
   Serial.println("Re-centred");
 }
 
@@ -378,12 +422,33 @@ uint16_t toPos(float angle, int sign, float rangeDeg) {
   return constrain(frac, 0.0f, 1.0f) * POS_MAX;
 }
 
+// Move the pointing reference so the current angles map to screen position
+// (x, y): the cursor carries on from there instead of jumping.
+void rebase(uint16_t x, uint16_t y) {
+  yawAngle = yawAnchor = YAW_SIGN * ((float)x / POS_MAX - 0.5) * 2 * YAW_RANGE_DEG;
+  yawEuro.reset(yawAngle);
+  pitchOffset = pitchAnchor - PITCH_SIGN * ((float)y / POS_MAX - 0.5) * 2 * PITCH_RANGE_DEG;
+}
+
+// The board keeps an internal position (x, y in 0..POS_MAX = one screen) but
+// sends only the change since the last report, like a normal mouse. The
+// laptop cursor therefore carries on from wherever the touchpad left it.
 void sendReport(uint16_t x, uint16_t y, int8_t wheel) {
-  MouseReport r = {buttons, x, y, wheel};
+  static float remX = 0, remY = 0;  // fractions of a pixel not sent yet
+  if (sentX > POS_MAX || sentY > POS_MAX) {  // nothing sent yet: no movement
+    sentX = x;
+    sentY = y;
+  }
+  float fx = ((int32_t)x - sentX) * SCREEN_W_PX / POS_MAX + remX;
+  float fy = ((int32_t)y - sentY) * SCREEN_H_PX / POS_MAX + remY;
+  int16_t dx = (int16_t)fx, dy = (int16_t)fy;
+  remX = fx - dx;
+  remY = fy - dy;
+  MouseReport r = {buttons, dx, dy, wheel};
   inputMouse->setValue((uint8_t *)&r, sizeof(r));
   inputMouse->notify();
-  lastX = x;
-  lastY = y;
+  lastX = sentX = x;
+  lastY = sentY = y;
 }
 
 // ---------- Buttons ----------
@@ -395,16 +460,37 @@ uint32_t btnChanged[3];
 
 // The module's wiring is unknown (buttons to VCC or to GND), so read each
 // pin at startup while nobody presses it: that level means "released".
+// After waking from sleep the levels saved before sleeping are used instead,
+// and the wake-up press is not sent as a click.
 void setupButtons() {
+  gpio_hold_dis((gpio_num_t)BTN_GND_PIN);  // was held LOW during sleep
   pinMode(BTN_GND_PIN, OUTPUT);
   digitalWrite(BTN_GND_PIN, LOW);
   for (int i = 0; i < 3; i++) pinMode(BTN_PINS[i], INPUT_PULLDOWN);
   delay(20);
+  bool woke = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1 && savedIdleValid;
   for (int i = 0; i < 3; i++) {
-    btnIdle[i] = digitalRead(BTN_PINS[i]);
-    btnState[i] = false;
+    btnIdle[i] = woke ? savedIdle[i] : digitalRead(BTN_PINS[i]);
+    btnState[i] = digitalRead(BTN_PINS[i]) != btnIdle[i];
     btnChanged[i] = 0;
   }
+  if (woke) Serial.println("Woke up from sleep");
+}
+
+// Deep sleep: MPU6050 asleep, button module ground held LOW, any button wakes
+void goToSleep() {
+  Serial.println("Going to sleep - press any button to wake");
+  Serial.flush();
+  writeReg(0x6B, 0x40);  // MPU6050 sleep
+  for (int i = 0; i < 3; i++) {
+    savedIdle[i] = btnIdle[i];
+    // wake when the pin leaves its released level
+    esp_sleep_enable_ext1_wakeup_io(1ULL << BTN_PINS[i],
+                                    btnIdle[i] ? ESP_EXT1_WAKEUP_ANY_LOW : ESP_EXT1_WAKEUP_ANY_HIGH);
+  }
+  savedIdleValid = true;
+  gpio_hold_en((gpio_num_t)BTN_GND_PIN);
+  esp_deep_sleep_start();
 }
 
 // Returns true if button i changed state (debounced); state is in btnState[i]
@@ -443,7 +529,7 @@ void setup() {
   delay(100);
   calibrate();
 
-  BLEDevice::init("Glyph H2 Mouse");
+  BLEDevice::init(loadName().c_str());
 
   BLESecurity *sec = new BLESecurity();
   sec->setCapability(ESP_IO_CAP_NONE);       // "Just Works" pairing
@@ -467,14 +553,60 @@ void setup() {
   adv->setScanResponse(true);
   BLEDevice::startAdvertising();
 
-  Serial.println("Glyph H2 Mouse ready - pair it from laptop Bluetooth settings");
+  Serial.printf("%s ready - pair it from laptop Bluetooth settings\n", loadName().c_str());
+  Serial.println("Type NAME <new name> to rename it");
+}
+
+// ---------- Bluetooth name (saved in flash) ----------
+String loadName() {
+  Preferences prefs;
+  prefs.begin("mouse", true);
+  String name = prefs.getString("name", DEFAULT_NAME);
+  prefs.end();
+  return name;
+}
+
+// Serial command "NAME <new name>": save the name, used after RESET
+void checkSerial() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c != '\n' && c != '\r') {
+      if (line.length() < 64) line += c;
+      continue;
+    }
+    line.trim();
+    if (line.equalsIgnoreCase("NAME")) {
+      Serial.printf("Name: %s\n", loadName().c_str());
+    } else if (line.length() > 5 && line.substring(0, 5).equalsIgnoreCase("NAME ")) {
+      String name = line.substring(5);
+      name.trim();
+      if (name.length() == 0 || name.length() > BT_NAME_MAX) {
+        Serial.printf("Name must be 1-%d characters\n", BT_NAME_MAX);
+      } else {
+        Preferences prefs;
+        prefs.begin("mouse", false);
+        prefs.putString("name", name);
+        prefs.end();
+        Serial.printf("Name saved: %s - press RESET to use it\n", name.c_str());
+      }
+    } else if (line.equalsIgnoreCase("SLEEP")) {
+      goToSleep();
+    } else if (line.length() > 0) {
+      Serial.println("Unknown command. Use: NAME <new name> or SLEEP");
+    }
+    line = "";
+  }
 }
 
 void loop() {
   static uint32_t lastReport = 0;
   static uint32_t lastMicros = micros();
 
+  checkSerial();
+
   if (!connected) {
+    if (millis() - lastUse > SLEEP_UNCONNECTED_MIN * 60000UL) goToSleep();
     delay(50);
     lastMicros = micros();
     return;
@@ -504,6 +636,12 @@ void loop() {
       clickX = lastX;
       clickY = lastY;
     }
+    if (newPress) {
+      holdLock = true;
+      pressYaw = yawAnchor;
+      pressPitch = pitchAnchor;
+    }
+    if (newButtons == 0) holdLock = false;
     if (released) lastRelease = now;
     buttons = newButtons;
     sendButtons();
@@ -525,6 +663,11 @@ void loop() {
       recenter();
     }
   }
+  // Sleep timer: restarts on any movement or held button
+  if (btnState[0] || btnState[1] || btnState[2]) lastUse = now;
+  if (lastActive > lastUse) lastUse = lastActive;
+  if (now - lastUse > SLEEP_IDLE_MIN * 60000UL) goToSleep();
+
   if (btnState[2] && !scrollMode && now - k1Start >= SCROLL_HOLD_MS) {
     scrollMode = true;
     scrollStartPitch = pitchAnchor;
@@ -589,10 +732,22 @@ void loop() {
       float pitch = pitchKf.update(accelPitch(acc), orient * dps[PITCH_AXIS], dt, accTrust);
       follow(pitch, pitchAnchor);
 
+      // Button held: stay locked until the board clearly turns (drag)
+      if (holdLock && max(fabs(yawAnchor - pressYaw), fabs(pitchAnchor - pressPitch)) > DRAG_START_DEG)
+        holdLock = false;
+      // Freeze/lock just ended: drop the button jolt, carry on from the frozen spot
+      bool locked = holdLock || now < freezeUntil;
+      if (wasLocked && !locked && lastX <= POS_MAX && lastY <= POS_MAX) rebase(lastX, lastY);
+      wasLocked = locked;
+
       // Only control the cursor while the board is really being moved, so
       // noise and slow drift never pull the cursor away from the touchpad
       if (fabs(dps[YAW_AXIS]) > ACTIVE_DPS || fabs(dps[PITCH_AXIS]) > ACTIVE_DPS) lastActive = now;
       bool active = lastActive != 0 && now - lastActive < IDLE_MS;
+      // Picked up again after the touchpad had control: start from where
+      // the laptop cursor is now, with the full swing range both ways
+      if (active && !wasActive && !holdLock) restartPointing();
+      wasActive = active;
 
       uint16_t x = toPos(yawAnchor, YAW_SIGN, YAW_RANGE_DEG);
       uint16_t y = toPos(pitchAnchor - pitchOffset, PITCH_SIGN, PITCH_RANGE_DEG);
@@ -619,8 +774,7 @@ void loop() {
         }
         return;
       }
-      bool frozen = now < freezeUntil;  // just pressed/released a button
-      if (active && !frozen && (x != lastX || y != lastY)) sendReport(x, y);
+      if (active && !locked && (x != lastX || y != lastY)) sendReport(x, y);
     }
   }
 }
