@@ -1,19 +1,18 @@
 /*
- * Glyph H2 - Bluetooth air mouse (point-to-move, Wii-remote style) - latest version
+ * Glyph H2 - Bluetooth air mouse (absolute pointer, Wii-remote style) - latest version
  *
- * Point the board like a remote to move the cursor:
- *   left/right swing (yaw)  -> cursor left/right, 2 x YAW_RANGE_DEG = screen width
- *   up/down tip (pitch)     -> cursor up/down,    2 x PITCH_RANGE_DEG = screen height
- * It sends relative movement like a normal mouse, so the cursor always carries
- * on from where it is, even after the touchpad moved it.
+ * Point the board like a remote: where it points is where the cursor goes.
+ *   left/right swing (yaw)  -> cursor left/right, ±YAW_RANGE_DEG = screen edges
+ *   up/down tip (pitch)     -> cursor up/down,    ±PITCH_RANGE_DEG = screen edges
+ * Pointing straight ahead (level) = screen centre. Swinging past an edge keeps
+ * the cursor at the edge, and coming back lines up again.
  *
  * The board only controls the cursor while it is being moved: lying still it
- * sends nothing, so the touchpad works normally. Moving it takes over again,
- * starting from wherever the cursor is.
+ * sends nothing, so the touchpad works normally. Moving it takes over again.
  *
  * Buttons (1x3 module):
  *   K3 = left click (hold = drag), K2 (middle) = right click,
- *   K1 short press = re-centre (whatever direction you point now = middle of the swing range),
+ *   K1 short press = re-centre (whatever direction you point now = screen centre),
  *   K1 hold = scroll mode: cursor freezes, tilt up/down to scroll up/down
  *             (further tilt = faster); release to carry on pointing.
  *
@@ -68,9 +67,7 @@ const int BT_NAME_MAX = 20;  // longer names don't fit in the advertising packet
 
 #define MPU_ADDR 0x68
 
-#define POS_MAX 32767   // internal coordinate range 0..POS_MAX covers one screen
-const float SCREEN_W_PX = 1366;  // laptop screen size: a full swing range moves this far
-const float SCREEN_H_PX = 768;
+#define POS_MAX 32767   // absolute coordinate range 0..POS_MAX covers the whole screen
 
 // Tuning
 const float YAW_RANGE_DEG = 15.0;    // swing this far left/right to reach the screen edge
@@ -85,11 +82,10 @@ const uint32_t DEBOUNCE_MS = 20;
 // lands where the cursor was CLICK_LOOKBACK samples (x10 ms) before the press,
 // and the cursor freezes for CLICK_FREEZE_MS after each press and release.
 // While a button is held the cursor stays locked until the board turns more
-// than DRAG_START_DEG (then it drags). Movement during a freeze or lock is
-// thrown away, so the cursor carries on from where it stopped.
+// than DRAG_START_DEG (then it drags).
 const int CLICK_LOOKBACK = 6;          // 60 ms
-const uint32_t CLICK_FREEZE_MS = 250;
-const uint32_t DOUBLE_CLICK_MS = 700;  // a press this soon after the last click reuses its exact spot
+const uint32_t CLICK_FREEZE_MS = 150;
+const uint32_t DOUBLE_CLICK_MS = 400;  // a press this soon after the last click reuses its exact spot
 const float DRAG_START_DEG = 3.0;      // turn this far with a button held to start dragging
 // Scroll mode (hold K1)
 const uint32_t SCROLL_HOLD_MS = 400;   // hold K1 this long to enter scroll mode
@@ -140,11 +136,11 @@ const uint8_t hidReportDescriptor[] = {
   0x05, 0x01,        //     Usage Page (Generic Desktop)
   0x09, 0x30,        //     Usage (X)
   0x09, 0x31,        //     Usage (Y)
-  0x16, 0x01, 0x80,  //     Logical Minimum (-32767)
+  0x16, 0x00, 0x00,  //     Logical Minimum (0)
   0x26, 0xFF, 0x7F,  //     Logical Maximum (32767)
   0x75, 0x10,        //     Report Size (16)
   0x95, 0x02,        //     Report Count (2)
-  0x81, 0x06,        //     Input (Data, Var, Rel)
+  0x81, 0x02,        //     Input (Data, Var, Abs)
   0x09, 0x38,        //     Usage (Wheel)
   0x15, 0x81,        //     Logical Minimum (-127)
   0x25, 0x7F,        //     Logical Maximum (127)
@@ -159,8 +155,8 @@ const uint8_t hidReportDescriptor[] = {
 // so it is not part of the payload.
 struct MouseReport {
   uint8_t buttons;
-  int16_t dx;  // relative movement in pixels
-  int16_t dy;
+  uint16_t x;
+  uint16_t y;
   int8_t wheel;
 } __attribute__((packed));
 
@@ -262,15 +258,12 @@ float yawAngle = 0;         // integrated swing angle, deg (0 = centre)
 float yawAnchor = 0, pitchAnchor = 0;  // jitter-free angles used for the cursor
 float pitchOffset = 0;      // up/down angle that maps to the screen centre (0 = level)
 float orient = 1;           // +1 = MPU6050 facing up (buttons down), -1 = flipped (buttons up)
-uint16_t lastX = 0xFFFF, lastY = 0xFFFF;  // cursor position to report next
-uint16_t sentX = 0xFFFF, sentY = 0xFFFF;  // position last sent to the laptop
-bool wasActive = false;
+uint16_t lastX = 0xFFFF, lastY = 0xFFFF;
 uint8_t buttons = 0;
 uint32_t lastActive = 0;    // last time the board was being moved
 uint32_t freezeUntil = 0;   // cursor ignores movement until this time (click stabilization)
 uint32_t lastRelease = 0;   // when a button was last released (double-click detection)
 bool holdLock = false;      // button held, cursor locked until the board turns DRAG_START_DEG
-bool wasLocked = false;
 float pressYaw = 0, pressPitch = 0;  // angles when the button was pressed
 uint16_t clickX = 0, clickY = 0;  // where the last click landed
 const int HIST_LEN = 16;
@@ -289,7 +282,7 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) {
     connected = true;
     lastUse = millis();
-    lastX = lastY = sentX = sentY = 0xFFFF;  // fresh start, no jump from old positions
+    lastX = lastY = 0xFFFF;  // force a report so the cursor jumps into place
     Serial.println("Laptop connected");
   }
 #if defined(CONFIG_NIMBLE_ENABLED)
@@ -346,20 +339,14 @@ float accelPitch(const float acc[3]) {
 
 void sendReport(uint16_t x, uint16_t y, int8_t wheel = 0);
 
-void rebase(uint16_t x, uint16_t y);
-
-// Start pointing afresh from wherever the laptop cursor is now: the current
-// direction becomes the middle of the pointing range, without moving the cursor.
-void restartPointing() {
-  rebase(POS_MAX / 2, POS_MAX / 2);
-  lastX = lastY = sentX = sentY = POS_MAX / 2;
-  histCount = 0;
-}
-
-// K1 tap: pointing direction now = middle of the range (full swing both ways)
+// Pointing direction now = screen centre, and move the cursor there.
 void recenter() {
   lastActive = millis();  // follow the board straight away after re-centring
-  restartPointing();
+  yawAngle = yawAnchor = 0;
+  yawEuro.reset(0);
+  pitchOffset = pitchAnchor;
+  if (connected) sendReport(POS_MAX / 2, POS_MAX / 2);
+  else lastX = lastY = 0xFFFF;
   Serial.println("Re-centred");
 }
 
@@ -422,33 +409,12 @@ uint16_t toPos(float angle, int sign, float rangeDeg) {
   return constrain(frac, 0.0f, 1.0f) * POS_MAX;
 }
 
-// Move the pointing reference so the current angles map to screen position
-// (x, y): the cursor carries on from there instead of jumping.
-void rebase(uint16_t x, uint16_t y) {
-  yawAngle = yawAnchor = YAW_SIGN * ((float)x / POS_MAX - 0.5) * 2 * YAW_RANGE_DEG;
-  yawEuro.reset(yawAngle);
-  pitchOffset = pitchAnchor - PITCH_SIGN * ((float)y / POS_MAX - 0.5) * 2 * PITCH_RANGE_DEG;
-}
-
-// The board keeps an internal position (x, y in 0..POS_MAX = one screen) but
-// sends only the change since the last report, like a normal mouse. The
-// laptop cursor therefore carries on from wherever the touchpad left it.
 void sendReport(uint16_t x, uint16_t y, int8_t wheel) {
-  static float remX = 0, remY = 0;  // fractions of a pixel not sent yet
-  if (sentX > POS_MAX || sentY > POS_MAX) {  // nothing sent yet: no movement
-    sentX = x;
-    sentY = y;
-  }
-  float fx = ((int32_t)x - sentX) * SCREEN_W_PX / POS_MAX + remX;
-  float fy = ((int32_t)y - sentY) * SCREEN_H_PX / POS_MAX + remY;
-  int16_t dx = (int16_t)fx, dy = (int16_t)fy;
-  remX = fx - dx;
-  remY = fy - dy;
-  MouseReport r = {buttons, dx, dy, wheel};
+  MouseReport r = {buttons, x, y, wheel};
   inputMouse->setValue((uint8_t *)&r, sizeof(r));
   inputMouse->notify();
-  lastX = sentX = x;
-  lastY = sentY = y;
+  lastX = x;
+  lastY = y;
 }
 
 // ---------- Buttons ----------
@@ -735,19 +701,11 @@ void loop() {
       // Button held: stay locked until the board clearly turns (drag)
       if (holdLock && max(fabs(yawAnchor - pressYaw), fabs(pitchAnchor - pressPitch)) > DRAG_START_DEG)
         holdLock = false;
-      // Freeze/lock just ended: drop the button jolt, carry on from the frozen spot
-      bool locked = holdLock || now < freezeUntil;
-      if (wasLocked && !locked && lastX <= POS_MAX && lastY <= POS_MAX) rebase(lastX, lastY);
-      wasLocked = locked;
 
       // Only control the cursor while the board is really being moved, so
       // noise and slow drift never pull the cursor away from the touchpad
       if (fabs(dps[YAW_AXIS]) > ACTIVE_DPS || fabs(dps[PITCH_AXIS]) > ACTIVE_DPS) lastActive = now;
       bool active = lastActive != 0 && now - lastActive < IDLE_MS;
-      // Picked up again after the touchpad had control: start from where
-      // the laptop cursor is now, with the full swing range both ways
-      if (active && !wasActive && !holdLock) restartPointing();
-      wasActive = active;
 
       uint16_t x = toPos(yawAnchor, YAW_SIGN, YAW_RANGE_DEG);
       uint16_t y = toPos(pitchAnchor - pitchOffset, PITCH_SIGN, PITCH_RANGE_DEG);
@@ -774,7 +732,8 @@ void loop() {
         }
         return;
       }
-      if (active && !locked && (x != lastX || y != lastY)) sendReport(x, y);
+      bool frozen = holdLock || now < freezeUntil;  // button held or just pressed/released
+      if (active && !frozen && (x != lastX || y != lastY)) sendReport(x, y);
     }
   }
 }
