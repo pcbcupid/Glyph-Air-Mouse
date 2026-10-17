@@ -12,7 +12,7 @@
  *
  * Buttons (1x3 module):
  *   K3 = left click (hold = drag), K2 (middle) = right click,
- *   K1 short press = re-centre (whatever direction you point now = screen centre),
+ *   K1 tap = re-centre when released (whatever direction you point now = screen centre),
  *   K1 hold = scroll mode: cursor freezes, tilt up/down to scroll up/down
  *             (further tilt = faster); release to carry on pointing.
  *
@@ -32,9 +32,9 @@
  * newline), then press RESET. The name is saved in flash. "NAME" alone
  * shows the current name.
  *
- * Sleep: after SLEEP_IDLE_MIN minutes without movement or buttons (or
- * SLEEP_UNCONNECTED_MIN minutes without a connection) the board goes into
- * deep sleep with the MPU6050 asleep too. Press any button to wake it: it
+ * Sleep: never while the laptop is connected. After SLEEP_UNCONNECTED_MIN
+ * minutes without a connection the board goes into deep sleep with the
+ * MPU6050 asleep too. Press any button to wake it: it
  * restarts, calibrates (keep it still ~1 s) and reconnects by itself.
  * "SLEEP" in the Serial Monitor sends it to sleep straight away.
  *
@@ -72,12 +72,14 @@ const int BT_NAME_MAX = 20;  // longer names don't fit in the advertising packet
 // Tuning
 const float YAW_RANGE_DEG = 15.0;    // swing this far left/right to reach the screen edge
 const float PITCH_RANGE_DEG = 12.0;  // tip this far up/down to reach the screen edge
-const float BACKLASH_DEG = 0.25;     // movement smaller than this is ignored (hand jitter)
-const float YAW_DEADZONE_DPS = 1.0;  // slower yaw than this is not integrated (limits drift)
+const float BACKLASH_DEG = 0.15;     // movement smaller than this is ignored (hand jitter)
+const float YAW_DEADZONE_DPS = 0.5;  // slower yaw than this is not integrated (limits drift)
 const float STILL_DPS = 1.5;         // board counts as "still" below this, for drift correction
 const float ACTIVE_DPS = 2.5;        // moving faster than this = board takes control of the cursor
 const uint32_t IDLE_MS = 1000;       // this long without movement = hand control back to touchpad
+const uint32_t RECENTER_CONTROL_MS = 5000;  // after K1 the board keeps the cursor this long, even moving slowly
 const uint32_t DEBOUNCE_MS = 20;
+const uint32_t K1_DEBOUNCE_MS = 60;  // longer for K1: a release bounce would re-centre mid-movement
 // Click stabilization: pressing a button jolts the board slightly. The click
 // lands where the cursor was CLICK_LOOKBACK samples (x10 ms) before the press,
 // and the cursor freezes for CLICK_FREEZE_MS after each press and release.
@@ -88,13 +90,12 @@ const uint32_t CLICK_FREEZE_MS = 150;
 const uint32_t DOUBLE_CLICK_MS = 400;  // a press this soon after the last click reuses its exact spot
 const float DRAG_START_DEG = 3.0;      // turn this far with a button held to start dragging
 // Scroll mode (hold K1)
-const uint32_t SCROLL_HOLD_MS = 400;   // hold K1 this long to enter scroll mode
+const uint32_t SCROLL_HOLD_MS = 400;   // hold K1 this long to enter scroll mode (shorter = a tap)
 const float SCROLL_DEADZONE_DEG = 3.0; // tilt less than this doesn't scroll
 const float SCROLL_SPEED = 0.6;        // wheel clicks per second per degree of tilt
 const float SCROLL_MAX = 30.0;         // wheel clicks per second at most
 const uint32_t REPORT_MS = 10;       // 100 Hz
 // Sleep (any button wakes it)
-const uint32_t SLEEP_IDLE_MIN = 5;         // connected but not used for this long
 const uint32_t SLEEP_UNCONNECTED_MIN = 2;  // no laptop connected for this long
 
 // Axes and directions (board flat). Flip a sign if that direction is reversed.
@@ -110,7 +111,7 @@ const float KF_R = 4.0;           // (deg/s)^2
 // One Euro filter on the left/right angle (adaptive smoothing):
 //   slow movement -> cutoff near EURO_MIN_CUTOFF (strong smoothing, no jitter)
 //   fast movement -> cutoff rises by EURO_BETA per deg/s (little smoothing, no lag)
-const float EURO_MIN_CUTOFF = 1.5;  // Hz - lower = less jitter when moving slowly
+const float EURO_MIN_CUTOFF = 2.5;  // Hz - lower = less jitter when moving slowly
 const float EURO_BETA = 0.2;        // higher = less lag when moving fast
 const float EURO_D_CUTOFF = 1.0;    // Hz - smoothing of the speed estimate
 
@@ -183,7 +184,7 @@ struct Kalman1D {
 // hand pushes the board around, the accelerometer feels the push as well as
 // gravity, so its angle is wrong and the filter should lean on the gyro.
 struct KalmanAngle {
-  const float Q_ANGLE = 0.001;  // process noise of the angle
+  const float Q_ANGLE = 0.003;  // process noise of the angle (higher = settles faster)
   const float Q_BIAS = 0.003;   // process noise of the bias
   const float R_MEAS = 0.03;    // accelerometer angle noise
   float angle = 0, bias = 0;
@@ -221,6 +222,12 @@ struct KalmanAngle {
 BLEHIDDevice *hid;
 BLECharacteristic *inputMouse;
 bool connected = false;
+BLEServer *bleServer;
+uint16_t connHandle = 0;
+float connIntervalMs = 0;   // Bluetooth connection interval the laptop chose
+uint32_t connectedAt = 0;
+int paramRetries = 0;
+uint32_t lastSend = 0;      // when the last position report was sent
 
 float gyroBias[3] = {0, 0, 0};
 uint16_t stillCount = 0;    // consecutive samples with the board still
@@ -261,6 +268,11 @@ float orient = 1;           // +1 = MPU6050 facing up (buttons down), -1 = flipp
 uint16_t lastX = 0xFFFF, lastY = 0xFFFF;
 uint8_t buttons = 0;
 uint32_t lastActive = 0;    // last time the board was being moved
+uint32_t controlUntil = 0;  // board keeps control of the cursor until this time (after K1)
+// A thumb pushing a button shakes the board and fools the accelerometer into
+// a false tilt; until this time up/down runs on the gyro alone
+uint32_t ignoreAccUntil = 0;
+const uint32_t BUTTON_SHAKE_MS = 300;
 uint32_t freezeUntil = 0;   // cursor ignores movement until this time (click stabilization)
 uint32_t lastRelease = 0;   // when a button was last released (double-click detection)
 bool holdLock = false;      // button held, cursor locked until the board turns DRAG_START_DEG
@@ -272,7 +284,7 @@ int histIdx = 0, histCount = 0;
 bool scrollMode = false;    // K1 held: tilt up/down scrolls instead of moving the cursor
 uint32_t k1Start = 0;
 float scrollStartPitch = 0, scrollSavedYaw = 0, scrollAcc = 0;
-uint32_t lastUse = 0;       // last movement, button press, connect or disconnect (sleep timer)
+uint32_t lastUse = 0;       // last connect or disconnect (sleep timer)
 // Kept through deep sleep: button released levels, since the wake-up button
 // is still held at startup and would be mistaken for "released"
 RTC_DATA_ATTR bool savedIdleValid = false;
@@ -281,7 +293,8 @@ RTC_DATA_ATTR bool savedIdle[3];
 class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer *s) {
     connected = true;
-    lastUse = millis();
+    lastUse = connectedAt = millis();
+    paramRetries = 0;
     lastX = lastY = 0xFFFF;  // force a report so the cursor jumps into place
     Serial.println("Laptop connected");
   }
@@ -289,10 +302,14 @@ class ServerCallbacks : public BLEServerCallbacks {
   // Ask the laptop for a fast connection interval (7.5-15 ms) so cursor
   // updates are delivered quickly. Units: interval 1.25 ms, timeout 10 ms.
   void onConnect(BLEServer *s, ble_gap_conn_desc *desc) {
+    connHandle = desc->conn_handle;
+    connIntervalMs = desc->conn_itvl * 1.25;
+    Serial.printf("Connection interval: %.2f ms\n", connIntervalMs);
     s->requestConnParams(desc->conn_handle, 6, 12, 0, 400);
   }
   void onConnParamsUpdate(uint16_t conn_handle, uint16_t interval, uint16_t latency, uint16_t timeout, uint8_t status) {
-    Serial.printf("Connection interval: %.2f ms\n", interval * 1.25);
+    connIntervalMs = interval * 1.25;
+    Serial.printf("Connection interval: %.2f ms\n", connIntervalMs);
   }
 #endif
   void onDisconnect(BLEServer *s) {
@@ -342,11 +359,19 @@ void sendReport(uint16_t x, uint16_t y, int8_t wheel = 0);
 // Pointing direction now = screen centre, and move the cursor there.
 void recenter() {
   lastActive = millis();  // follow the board straight away after re-centring
+  controlUntil = lastActive + RECENTER_CONTROL_MS;  // and follow even slow aiming movements
   yawAngle = yawAnchor = 0;
   yawEuro.reset(0);
   pitchOffset = pitchAnchor;
-  if (connected) sendReport(POS_MAX / 2, POS_MAX / 2);
-  else lastX = lastY = 0xFFFF;
+  if (connected) {
+    // The laptop drops an absolute position equal to the last one this
+    // device sent (e.g. centre again after the touchpad moved the cursor),
+    // so step 1 unit off-centre first (invisible) to force the jump
+    sendReport(POS_MAX / 2 + 1, POS_MAX / 2 + 1);
+    sendReport(POS_MAX / 2, POS_MAX / 2);
+  } else {
+    lastX = lastY = 0xFFFF;
+  }
   Serial.println("Re-centred");
 }
 
@@ -413,6 +438,7 @@ void sendReport(uint16_t x, uint16_t y, int8_t wheel) {
   MouseReport r = {buttons, x, y, wheel};
   inputMouse->setValue((uint8_t *)&r, sizeof(r));
   inputMouse->notify();
+  lastSend = millis();
   lastX = x;
   lastY = y;
 }
@@ -462,7 +488,7 @@ void goToSleep() {
 // Returns true if button i changed state (debounced); state is in btnState[i]
 bool readButton(int i, uint32_t now) {
   bool pressed = digitalRead(BTN_PINS[i]) != btnIdle[i];
-  if (pressed != btnState[i] && now - btnChanged[i] >= DEBOUNCE_MS) {
+  if (pressed != btnState[i] && now - btnChanged[i] >= (i == 2 ? K1_DEBOUNCE_MS : DEBOUNCE_MS)) {
     btnState[i] = pressed;
     btnChanged[i] = now;
     return true;
@@ -478,6 +504,10 @@ void sendButtons() {
 
 void setup() {
   Serial.begin(115200);
+  // Never wait on the USB serial: plugged into a computer with no program
+  // reading the port, each print would block up to 2 s (20 x 100 ms) once the
+  // buffer is full, freezing the cursor (e.g. after K1's "Re-centred")
+  Serial.setTxTimeoutMs(0);
 
   setupButtons();
   pinMode(XDA_PIN, INPUT);
@@ -496,12 +526,16 @@ void setup() {
   calibrate();
 
   BLEDevice::init(loadName().c_str());
+  // Maximum transmit power (+20 dBm): a stronger signal survives the
+  // laptop's Wi-Fi sharing the 2.4 GHz band and fingers over the antenna
+  BLEDevice::setPower(ESP_PWR_LVL_P20, ESP_BLE_PWR_TYPE_DEFAULT);
+  BLEDevice::setPower(ESP_PWR_LVL_P20, ESP_BLE_PWR_TYPE_ADV);
 
   BLESecurity *sec = new BLESecurity();
   sec->setCapability(ESP_IO_CAP_NONE);       // "Just Works" pairing
   sec->setAuthenticationMode(true, false, true);
 
-  BLEServer *server = BLEDevice::createServer();
+  BLEServer *server = bleServer = BLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
 
   hid = new BLEHIDDevice(server);
@@ -520,7 +554,25 @@ void setup() {
   BLEDevice::startAdvertising();
 
   Serial.printf("%s ready - pair it from laptop Bluetooth settings\n", loadName().c_str());
+  Serial.printf("Last restart: %s\n", resetReasonText());
   Serial.println("Type NAME <new name> to rename it");
+}
+
+// Why the board last restarted, for diagnosing unexpected restarts
+const char *resetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "power on";
+    case ESP_RST_EXT: return "reset pin";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "CRASH (panic)";
+    case ESP_RST_INT_WDT: return "CRASH (interrupt watchdog)";
+    case ESP_RST_TASK_WDT: return "CRASH (task watchdog)";
+    case ESP_RST_WDT: return "CRASH (watchdog)";
+    case ESP_RST_DEEPSLEEP: return "wake from sleep";
+    case ESP_RST_BROWNOUT: return "POWER DIP (brownout)";
+    case ESP_RST_USB: return "USB reset";
+    default: return "other";
+  }
 }
 
 // ---------- Bluetooth name (saved in flash) ----------
@@ -578,6 +630,16 @@ void loop() {
     return;
   }
 
+#if defined(CONFIG_NIMBLE_ENABLED)
+  // The laptop may ignore the fast-interval request made right at connect:
+  // ask again a few times, 2 s apart, until it is 15 ms or less
+  if (connIntervalMs > 15 && paramRetries < 3 && millis() - connectedAt > 2000UL * (paramRetries + 1)) {
+    paramRetries++;
+    bool ok = bleServer->requestConnParams(connHandle, 6, 12, 0, 400);
+    Serial.printf("Asked for a faster connection interval (now %.2f ms): %s\n", connIntervalMs, ok ? "sent" : "failed");
+  }
+#endif
+
   // Buttons: K3 = left (hold = drag), K2 = right, K1 = re-centre / scroll
   uint32_t now = millis();
   bool changed = false;
@@ -612,9 +674,11 @@ void loop() {
     buttons = newButtons;
     sendButtons();
     freezeUntil = now + CLICK_FREEZE_MS;  // hold still through the press/release jolt
+    ignoreAccUntil = now + BUTTON_SHAKE_MS;
   }
-  // K1: short press = re-centre, hold = scroll mode
+  // K1: tap = re-centre on release, hold = scroll mode (cursor stays put)
   if (readButton(2, now)) {
+    ignoreAccUntil = now + BUTTON_SHAKE_MS;
     if (btnState[2]) {
       k1Start = now;
     } else if (scrollMode) {
@@ -626,16 +690,12 @@ void loop() {
       yawEuro.reset(scrollSavedYaw);
       freezeUntil = now + CLICK_FREEZE_MS;
     } else {
-      recenter();
+      recenter();  // released before SCROLL_HOLD_MS: a tap
     }
   }
-  // Sleep timer: restarts on any movement or held button
-  if (btnState[0] || btnState[1] || btnState[2]) lastUse = now;
-  if (lastActive > lastUse) lastUse = lastActive;
-  if (now - lastUse > SLEEP_IDLE_MIN * 60000UL) goToSleep();
-
   if (btnState[2] && !scrollMode && now - k1Start >= SCROLL_HOLD_MS) {
     scrollMode = true;
+    Serial.println("Scroll mode on");
     scrollStartPitch = pitchAnchor;
     scrollSavedYaw = yawAnchor;
     scrollAcc = 0;
@@ -668,6 +728,7 @@ void loop() {
       float accMag = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
       float accDev = fabs(accMag - 1.0);
       float accTrust = accDev > 0.25 ? 0 : 1.0 / (1.0 + 400.0 * accDev * accDev);
+      if (now < ignoreAccUntil) accTrust = 0;  // button push shaking the board
 
       // Track "up" in board coordinates: the gyro turns it as the board
       // rotates (du/dt = -w x u), the accelerometer gently corrects it.
@@ -705,7 +766,7 @@ void loop() {
       // Only control the cursor while the board is really being moved, so
       // noise and slow drift never pull the cursor away from the touchpad
       if (fabs(dps[YAW_AXIS]) > ACTIVE_DPS || fabs(dps[PITCH_AXIS]) > ACTIVE_DPS) lastActive = now;
-      bool active = lastActive != 0 && now - lastActive < IDLE_MS;
+      bool active = (lastActive != 0 && now - lastActive < IDLE_MS) || now < controlUntil;
 
       uint16_t x = toPos(yawAnchor, YAW_SIGN, YAW_RANGE_DEG);
       uint16_t y = toPos(pitchAnchor - pitchOffset, PITCH_SIGN, PITCH_RANGE_DEG);
@@ -733,7 +794,11 @@ void loop() {
         return;
       }
       bool frozen = holdLock || now < freezeUntil;  // button held or just pressed/released
-      if (active && !frozen && (x != lastX || y != lastY)) sendReport(x, y);
+      // At most one position per connection interval: positions are absolute,
+      // so the newest one is all that matters, and sending faster than the
+      // link delivers would only queue up old positions (cursor lag)
+      bool linkReady = now - lastSend >= max((float)REPORT_MS, connIntervalMs);
+      if (active && !frozen && linkReady && (x != lastX || y != lastY)) sendReport(x, y);
     }
   }
 }
